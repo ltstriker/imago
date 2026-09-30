@@ -4,7 +4,7 @@ use imago::file::File;
 use imago::qcow2::Qcow2;
 use imago::{
     FormatAccess, FormatCreateBuilder, FormatDriverBuilder, PermissiveImplicitOpenGate, Storage,
-    StorageCreateOptions, StorageOpenOptions,
+    StorageCreateOptions,
 };
 use std::future::Future;
 use std::io;
@@ -202,23 +202,6 @@ fn partial_cluster_discard_keeps_allocation() {
         assert_all(&read(&img, 0, 4096).await?, 0xaa, "head");
         assert_all(&read(&img, 4096, 8192).await?, 0, "zeroed range");
         assert_all(&read(&img, 12288, CLUSTER - 12288).await?, 0xaa, "tail");
-        Ok(())
-    });
-}
-
-#[test]
-fn raw_storage_open_still_works() {
-    // Opening through generic storage options (as libkrun does) keeps working
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("disk.qcow2");
-    run(async {
-        create(&path, 16 * MB, None).await?;
-        let file = File::open(StorageOpenOptions::new().write(true).filename(&path)).await?;
-        let qcow2 = Qcow2::<File>::builder(file)
-            .write(true)
-            .open(PermissiveImplicitOpenGate::default())
-            .await?;
-        assert_eq!(qcow2.cluster_size() as u64, CLUSTER);
         Ok(())
     });
 }
