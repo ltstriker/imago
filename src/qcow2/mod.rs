@@ -207,6 +207,14 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
         self.header.backing_format()
     }
 
+    /// Cluster size in bytes.
+    ///
+    /// Discard and zeroing requests only take effect on whole clusters, so this is the useful
+    /// discard granularity to advertise to guests.
+    pub fn cluster_size(&self) -> usize {
+        self.header.cluster_size()
+    }
+
     /// Assign the data file.
     ///
     /// `None` means using the same data storage for both metadata and data, which should be used
