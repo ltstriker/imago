@@ -114,6 +114,15 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
         }
     }
 
+    /// Write cached refcount changes to the image file.
+    ///
+    /// Must be called before a newly allocated cluster is referenced from a structure that is
+    /// written directly (i.e. not through a cache with a dependency on the refcount cache), so the
+    /// reference never reaches the file before the cluster's refcount does.
+    pub(super) async fn flush_refcounts(&self) -> io::Result<()> {
+        self.allocator().await?.rb_cache.flush().await
+    }
+
     /// Free metadata clusters (i.e. decrement their refcount).
     ///
     /// Best-effort operation.  On error, the given clusters may be leaked, but no errors are ever

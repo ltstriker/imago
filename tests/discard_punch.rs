@@ -222,3 +222,43 @@ fn raw_storage_open_still_works() {
         Ok(())
     });
 }
+
+/// A new L2 table's refcount must reach the file before the L1 entry that points to it. Otherwise,
+/// if the process exits without a final flush (e.g. the VM is killed), the table is referenced
+/// but looks free on reopen, gets reallocated for data, and its entries turn into garbage; freeing
+/// such a garbage entry can then punch a hole into the image header.
+#[test]
+fn new_l2_table_is_refcounted_before_l1_points_to_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("disk.qcow2");
+    run(async {
+        create(&path, 2048 * MB, None).await?;
+        let img = open(&path).await?;
+        img.write(&vec![0xaa; CLUSTER as usize][..], 0).await?;
+        img.flush().await?;
+
+        // Allocates a second L2 table (one covers 512 MiB); exit without flushing
+        img.write(&vec![0xbb; CLUSTER as usize][..], 600 * MB)
+            .await?;
+        drop(img);
+
+        // New allocations must not reuse the L2 table's cluster
+        let mut img = open(&path).await?;
+        img.write(&vec![0xcc; (4 * CLUSTER) as usize][..], CLUSTER)
+            .await?;
+        img.flush().await?;
+        let second_l2_range = read(&img, 512 * MB, 512 * MB).await;
+        assert!(
+            second_l2_range.is_ok_and(|buf| buf.iter().all(|&b| b == 0 || b == 0xbb)),
+            "L2 table was overwritten by data"
+        );
+        img.discard_to_any(512 * MB, 512 * MB).await?;
+        img.flush().await?;
+        drop(img);
+
+        let img = open(&path).await?;
+        assert_all(&read(&img, 0, CLUSTER).await?, 0xaa, "first cluster");
+        assert_all(&read(&img, CLUSTER, 4 * CLUSTER).await?, 0xcc, "rewritten");
+        Ok(())
+    });
+}

@@ -300,6 +300,8 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
         let l2_cluster = self.allocate_meta_cluster().await?;
         l2_table.set_cluster(l2_cluster);
         l2_table.write(self.metadata.as_ref()).await?;
+        // The L1 entry is written directly, so the L2 table's refcount must be on disk first
+        self.flush_refcounts().await?;
 
         l1_locked.enter_l2_table(l1_index, &l2_table)?;
         l1_locked
@@ -333,6 +335,8 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
 
         new_l1.set_cluster(l1_start);
         new_l1.write(self.metadata.as_ref()).await?;
+        // The header is written directly, so the new L1 table's refcount must be on disk first
+        self.flush_refcounts().await?;
 
         self.header.set_l1_table(&new_l1)?;
         self.header
