@@ -28,11 +28,20 @@ fn allocated(path: &Path) -> u64 {
 }
 
 async fn create(path: &Path, size: u64, backing: Option<&Path>) -> io::Result<()> {
+    create_with_cluster_size(path, size, backing, CLUSTER).await
+}
+
+async fn create_with_cluster_size(
+    path: &Path,
+    size: u64,
+    backing: Option<&Path>,
+    cluster_size: u64,
+) -> io::Result<()> {
     let opts = StorageCreateOptions::new().filename(path).size(0);
     let file = File::create_open(opts).await?;
     let mut builder = Qcow2::<File>::create_builder(file)
         .size(size)
-        .cluster_size(CLUSTER as usize);
+        .cluster_size(cluster_size as usize);
     if let Some(backing) = backing {
         builder = builder.backing(backing.to_str().unwrap().to_string(), "raw".to_string());
     }
@@ -242,6 +251,52 @@ fn new_l2_table_is_refcounted_before_l1_points_to_it() {
         let img = open(&path).await?;
         assert_all(&read(&img, 0, CLUSTER).await?, 0xaa, "first cluster");
         assert_all(&read(&img, CLUSTER, 4 * CLUSTER).await?, 0xcc, "rewritten");
+        Ok(())
+    });
+}
+
+/// Freed clusters are tracked per refcount block. One block covers 2 GiB of host file with the
+/// default 64 KiB clusters, but only 8 MiB with 4 KiB clusters, so this exercises clusters in
+/// later refcount blocks and freed ranges that cross from one block into the next.
+#[test]
+fn discard_punches_clusters_across_refcount_blocks() {
+    const SMALL_CLUSTER: u64 = 4096;
+    // 16-bit refcounts: one refcount block holds SMALL_CLUSTER / 2 entries
+    const RB_COVERAGE: u64 = SMALL_CLUSTER / 2 * SMALL_CLUSTER;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("disk.qcow2");
+    run(async {
+        create_with_cluster_size(&path, 256 * MB, None, SMALL_CLUSTER).await?;
+        let mut img = open(&path).await?;
+
+        // Spans at least three refcount blocks of host file
+        let data_len = 3 * RB_COVERAGE;
+        img.write(&vec![0xaa; data_len as usize][..], 0).await?;
+        img.flush().await?;
+        assert!(std::fs::metadata(&path)?.len() > 2 * RB_COVERAGE);
+        let before = allocated(&path);
+
+        img.discard_to_any(0, data_len).await?;
+        img.flush().await?;
+        let after = allocated(&path);
+        assert!(
+            after + data_len * 9 / 10 <= before,
+            "discard across refcount blocks did not free host space: before {before}, after {after}"
+        );
+
+        // Freed clusters in every block are reusable and hold new data correctly
+        img.write(&vec![0x55; data_len as usize][..], 64 * MB)
+            .await?;
+        img.flush().await?;
+        drop(img);
+        let img = open(&path).await?;
+        assert_all(&read(&img, 0, data_len).await?, 0, "discarded range");
+        assert_all(
+            &read(&img, 64 * MB, data_len).await?,
+            0x55,
+            "rewritten range",
+        );
         Ok(())
     });
 }
