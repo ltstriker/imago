@@ -114,20 +114,38 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
         }
     }
 
+    /// Write cached refcount changes to the image file.
+    ///
+    /// Must be called before a newly allocated cluster is referenced from a structure that is
+    /// written directly (i.e. not through a cache with a dependency on the refcount cache), so the
+    /// reference never reaches the file before the cluster's refcount does.
+    pub(super) async fn flush_refcounts(&self) -> io::Result<()> {
+        self.allocator().await?.rb_cache.flush().await
+    }
+
     /// Free metadata clusters (i.e. decrement their refcount).
     ///
     /// Best-effort operation.  On error, the given clusters may be leaked, but no errors are ever
     /// returned (because there is no good way to handle such errors anyway).
     pub(super) async fn free_meta_clusters(&self, cluster: HostCluster, count: ClusterCount) {
         if let Ok(mut allocator) = self.allocator().await {
-            allocator.free_clusters(cluster, count).await
+            allocator.free_clusters(cluster, count).await;
         }
     }
 
     /// Free data clusters (i.e. decrement their refcount).
     ///
-    /// Best-effort operation.  On error, the given clusters may be leaked, but no errors are ever
-    /// returned (because there is no good way to handle such errors anyway).
+    /// Clusters whose refcount drops to 0 are discarded in the underlying storage (i.e. a hole is
+    /// punched into the image file), so the space is returned to the host.  This happens while
+    /// the allocator is still locked, so a freed cluster cannot be reallocated (and written to)
+    /// before its discard has completed.
+    ///
+    /// The discard makes the cluster’s previous data unreadable.  The caller must ensure that no
+    /// concurrent I/O still uses a mapping to any of the freed clusters.
+    ///
+    /// Best-effort operation.  On error, the given clusters may be leaked (or stay allocated in
+    /// the storage layer), but no errors are ever returned (because there is no good way to
+    /// handle such errors anyway).
     pub(super) async fn free_data_clusters(&self, cluster: HostCluster, count: ClusterCount) {
         if !self.header.external_data_file() {
             if let Ok(mut allocator) = self.allocator().await {
@@ -137,7 +155,17 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
                     return;
                 }
 
-                allocator.free_clusters(cluster, count).await;
+                let freed = allocator.free_clusters(cluster, count).await;
+
+                // Keep `allocator` locked until the discards are done
+                let cluster_bits = self.header.cluster_bits();
+                for (start, count) in freed {
+                    let offset = start.offset(cluster_bits).0;
+                    let length = count.byte_size(cluster_bits);
+                    if let Err(err) = self.storage().discard(offset, length).await {
+                        warn!("Failed to discard freed clusters at 0x{offset:x} (length {length}): {err}");
+                    }
+                }
             }
         }
     }
@@ -498,11 +526,20 @@ impl<S: Storage> Allocator<S> {
 
     /// Free clusters (i.e. decrement their refcount).
     ///
+    /// Return the ranges of clusters whose refcount has dropped to 0 (adjacent clusters merged
+    /// into one range).
+    ///
     /// Best-effort operation.  On error, the given clusters may be leaked, but no errors are ever
     /// returned (because there is no good way to handle such errors anyway).
-    async fn free_clusters(&mut self, start: HostCluster, mut count: ClusterCount) {
+    async fn free_clusters(
+        &mut self,
+        start: HostCluster,
+        mut count: ClusterCount,
+    ) -> Vec<(HostCluster, ClusterCount)> {
+        let mut freed: Vec<(HostCluster, ClusterCount)> = Vec::new();
+
         if count.0 == 0 {
-            return;
+            return freed;
         }
 
         if start < self.first_free_cluster {
@@ -520,8 +557,21 @@ impl<S: Storage> Allocator<S> {
                 Ok(Some(rb)) => {
                     let mut rb = rb.lock_write().await;
                     for i in rb_index..(rb_index + in_rb_count) {
-                        if let Err(err) = rb.decrement(i) {
-                            event!(Level::WARN, "Failed to free cluster: {err}");
+                        match rb.decrement(i) {
+                            // `decrement()` returns the old refcount
+                            Ok(1) => {
+                                let cluster = HostCluster::from_ref_indices(rt_index, i, rb_bits);
+                                match freed.last_mut() {
+                                    Some((last_start, last_count))
+                                        if *last_start + *last_count == cluster =>
+                                    {
+                                        *last_count += ClusterCount(1);
+                                    }
+                                    _ => freed.push((cluster, ClusterCount(1))),
+                                }
+                            }
+                            Ok(_) => (),
+                            Err(err) => event!(Level::WARN, "Failed to free cluster: {err}"),
                         }
                     }
                 }
@@ -539,5 +589,7 @@ impl<S: Storage> Allocator<S> {
             rb_index = 0;
             rt_index += 1;
         }
+
+        freed
     }
 }
